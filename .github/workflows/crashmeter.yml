@@ -1,0 +1,35 @@
+name: Crashmeter Daily
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'   # 01:00 UTC = 08:00 WIB, Senin-Jumat
+  workflow_dispatch:          # Bisa juga dijalankan manual dari GitHub UI
+
+jobs:
+  crashmeter:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas matplotlib
+
+      - name: Run Crashmeter
+        run: python crashmeter_auto.py
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+
+      - name: Commit log & chart
+        run: |
+          git config user.name "Crashmeter Bot"
+          git config user.email "bot@crashmeter"
+          git add crashmeter_log.csv crashmeter_latest.png crashmeter_trend.png || true
+          git diff --cached --quiet || git commit -m "Crashmeter update $(date +%Y-%m-%d)"
+          git push
