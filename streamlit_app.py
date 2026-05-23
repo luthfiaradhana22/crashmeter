@@ -233,7 +233,7 @@ def hitung_skor(t10y3m, hy_now, hy_6m, cape, inversion_end):
     params['A1'] = {'label': 'Yield Curve T10Y-3M', 'nilai': f'{t10y3m:.3f}',
                     'skor': a1, 'zona': zona, 'severity': 'danger' if a1 else 'safe'}
 
-    months = (datetime.today() - inversion_end).days / 30.4
+    months = (datetime.today().date() - inversion_end).days / 30.4
     a2 = 1 if months < 18 else 0
     params['A2'] = {'label': 'Pasca-inversi 18 bln', 'nilai': f'{months:.1f} bln',
                     'skor': a2, 'zona': f'Sisa {max(0,18-months):.1f} bln lagi' if a2 else 'Sudah >18 bln',
