@@ -156,7 +156,8 @@ def fred_get(series_id, api_key, n_obs=5, start_date=None):
     p = {'series_id': series_id, 'api_key': api_key,
          'file_type': 'json', 'sort_order': 'desc', 'limit': n_obs}
     if start_date:
-        p.update({'observation_start': start_date, 'sort_order': 'asc', 'limit': 10})
+        # Saat pakai start_date, ambil ascending dan pakai n_obs sebagai limit
+        p.update({'observation_start': start_date, 'sort_order': 'asc', 'limit': n_obs})
     r = requests.get(url, params=p, timeout=15)
     r.raise_for_status()
     obs = r.json().get('observations', [])
@@ -190,7 +191,7 @@ def detect_inversion_end(api_key):
     di mana nilai berubah dari < 0 ke >= 0.
     """
     start = (datetime.today() - timedelta(days=4*365)).strftime('%Y-%m-%d')
-    data = fred_get('T10Y3M', api_key, n_obs=1200, start_date=start)
+    data = fred_get('T10Y3M', api_key, n_obs=2000, start_date=start)
     if not data:
         return None, None
 
@@ -230,7 +231,8 @@ def fetch_all_data(api_key):
         results['hy_now']  = hy[0][1]
         results['hy_date'] = hy[0][0]
         six_m = (datetime.today() - timedelta(days=182)).strftime('%Y-%m-%d')
-        hy6   = fred_get('BAMLH0A0HYM2', api_key, start_date=six_m)
+        # limit 30 cukup untuk ambil beberapa obs sekitar 6 bulan lalu
+        hy6   = fred_get('BAMLH0A0HYM2', api_key, n_obs=30, start_date=six_m)
         results['hy_6m']   = hy6[0][1] if hy6 else hy[0][1]
     except Exception as e:
         errors.append(f"HY OAS: {e}")
