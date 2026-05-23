@@ -1,0 +1,7 @@
+.streamlit/secrets.toml
+crashmeter_log.csv
+crashmeter_latest.png
+crashmeter_trend.png
+__pycache__/
+*.pyc
+.env
