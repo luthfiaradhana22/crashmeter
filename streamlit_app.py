@@ -694,7 +694,7 @@ with tab2:
                 if df_cape_raw is not None and len(df_cape_raw) > 10:
                     df_cape_raw["date"] = pd.to_datetime(df_cape_raw["date"])
                     df_cape_raw.set_index("date", inplace=True)
-                    df_m["cape"] = df_cape_raw["value"].resample("ME").last().reindex(df_m.index, method="ffill")
+                    df_m["cape"] = df_cape_raw["value"].resample("ME").last().reindex(df_m.index, method=".ffill()")
                 else:
                     # Hardcoded CAPE milestones untuk interpolasi kasar
                     cape_pts = {
@@ -710,7 +710,7 @@ with tab2:
                         df_m.index.union(cape_series.index)
                     ).interpolate(method="time").reindex(df_m.index)
 
-                df_m["cape"] = df_m["cape"].fillna(method="ffill")
+                df_m["cape"] = df_m["cape"].fillna(method=".ffill()")
                 df_m = df_m.dropna()
 
                 # ── Hitung HY velocity 6-bln ──
