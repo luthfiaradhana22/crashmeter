@@ -614,338 +614,315 @@ with tab1:
 # ─────────────────────────────────────────────
 with tab2:
 
-    st.markdown("#### Backtesting Crashmeter v3.0")
-    st.markdown(
-        "Ambil data historis dari FRED, hitung skor Crashmeter tiap bulan, "
-        "dan evaluasi seberapa akurat sinyal exit-nya di tiap crash besar."
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def fred_history(series_id, api_key, start="1996-01-01"):
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        p   = {"series_id": series_id, "api_key": api_key,
+               "file_type": "json", "observation_start": start,
+               "sort_order": "asc", "limit": 10000}
+        r   = requests.get(url, params=p, timeout=30)
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+        rows = [(o["date"], float(o["value"]))
+                for o in obs if o["value"] not in (".", "nan")]
+        df  = pd.DataFrame(rows, columns=["date", "value"])
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date")["value"]
+
+    def build_monthly(api_key):
+        """Fetch + resample semua series ke bulanan."""
+        yc  = fred_history("T10Y3M",       api_key)
+        hy  = fred_history("BAMLH0A0HYM2", api_key)
+        spx = fred_history("SP500",        api_key)
+
+        df = pd.DataFrame({
+            "yc":  yc .resample("ME").last(),
+            "hy":  hy .resample("ME").last(),
+            "spx": spx.resample("ME").last(),
+        }).dropna(subset=["yc","hy","spx"])
+
+        # CAPE — interpolasi dari milestones historis
+        cape_pts = {
+            "1996-01-31":24.8, "2000-03-31":44.2, "2002-10-31":21.9,
+            "2007-10-31":27.5, "2009-03-31":13.3, "2013-01-31":22.2,
+            "2018-01-31":33.3, "2020-03-31":24.8, "2021-12-31":40.0,
+            "2022-10-31":27.5, "2024-01-31":34.0, "2026-05-31":41.7,
+        }
+        cape_s = pd.Series({pd.Timestamp(k): v for k,v in cape_pts.items()}).sort_index()
+        combined = df.index.union(cape_s.index)
+        df["cape"] = cape_s.reindex(combined).interpolate(method="time").reindex(df.index).ffill().bfill()
+
+        # HY velocity 6 bln
+        df["hy_vel"] = (df["hy"] - df["hy"].shift(6)).abs() * 100
+
+        # Deteksi bulan pasca-inversi
+        df["inverted"] = df["yc"] < 0
+        last_inv_end   = None
+        post_inv       = []
+        for i in range(len(df)):
+            if i > 0 and df["inverted"].iloc[i-1] and not df["inverted"].iloc[i]:
+                last_inv_end = df.index[i]
+            if last_inv_end is not None:
+                months = (df.index[i] - last_inv_end).days / 30.4
+            else:
+                months = 999
+            post_inv.append(months)
+        df["post_inv_months"] = post_inv
+        return df
+
+    def score_row(row, p):
+        a1 = 0 if row["yc"]       > p["thr_yc"]  else 1
+        a2 = 1 if row["post_inv_months"] < p["thr_inv"] else 0
+        b1 = 0 if row["hy_vel"]   < p["thr_hyv"] else 1
+        b2 = 0 if row["hy"]*100   < p["thr_hyl"] else 1
+        c  = 0 if row["cape"]     < p["thr_cape"] else 1
+        return a1+a2+b1+b2+c, {"A1":a1,"A2":a2,"B1":b1,"B2":b2,"C":c}
+
+    def make_event_chart(df, ev, params, exit_score):
+        """Buat figure per-event mirip gambar referensi."""
+        peak_dt   = pd.Timestamp(ev["peak"])
+        trough_dt = pd.Timestamp(ev["trough"])
+        w_start   = peak_dt   - pd.DateOffset(months=ev.get("pre_months", 18))
+        w_end     = trough_dt + pd.DateOffset(months=ev.get("post_months", 18))
+        dz        = df[(df.index >= w_start) & (df.index <= w_end)].copy()
+
+        if len(dz) < 3:
+            return None, None
+
+        dz["score"] = dz.apply(lambda r: score_row(r, params)[0], axis=1)
+
+        # Key stats
+        spx_peak   = dz.loc[peak_dt,   "spx"] if peak_dt   in dz.index else dz["spx"].max()
+        spx_trough = dz.loc[trough_dt, "spx"] if trough_dt in dz.index else dz["spx"].min()
+        drawdown   = (spx_trough - spx_peak) / spx_peak * 100
+
+        exit_rows  = dz[(dz.index <= peak_dt + pd.DateOffset(months=3)) & (dz["score"] >= exit_score)]
+        if len(exit_rows):
+            exit_dt    = exit_rows.index[0]
+            spx_exit   = dz.loc[exit_dt, "spx"]
+            lead_months= (peak_dt - exit_dt).days / 30.4
+            saved_pct  = (spx_exit - spx_trough) / spx_exit * 100
+            missed_pct = (spx_peak - spx_exit)   / spx_peak * 100
+            exit_score_val = int(dz.loc[exit_dt, "score"])
+        else:
+            exit_dt = spx_exit = lead_months = saved_pct = missed_pct = exit_score_val = None
+
+        # ── Figure ──
+        fig, (ax_spx, ax_cm) = plt.subplots(
+            2, 1, figsize=(12, 6), sharex=True,
+            gridspec_kw={"height_ratios": [3, 1.2], "hspace": 0.08}
+        )
+        fig.patch.set_facecolor("white")
+
+        # Title
+        fig.suptitle(f"Backtesting: {ev['name']}",
+                     x=0.01, y=1.01, ha="left",
+                     fontsize=14, fontweight="bold", color="#111827")
+        if exit_dt:
+            subtitle = (f"Crashmeter v3 signal: EXIT {exit_dt.strftime('%b %Y')} — "
+                        f"SPX {spx_exit:.0f} ({-missed_pct:.1f}% dari peak {spx_peak:.0f})")
+        else:
+            subtitle = "Crashmeter v3 signal: tidak terdeteksi dalam window ini"
+        fig.text(0.01, 0.985, subtitle, ha="left", fontsize=8.5,
+                 color="#6b7280", style="italic", transform=fig.transFigure)
+
+        # ── SPX ──
+        ax_spx.set_facecolor("white")
+        ax_spx.plot(dz.index, dz["spx"], color="#1e3a8a", lw=2, label="SPX Close Price")
+        ax_spx.set_ylabel("SPX Close Price", fontsize=9, color="#374151")
+        ax_spx.tick_params(colors="#6b7280", labelsize=8)
+        for sp in ax_spx.spines.values(): sp.set_color("#e5e7eb")
+        ax_spx.text(dz.index[-1], dz["spx"].iloc[-1], "SPX Close Price",
+                    fontsize=7.5, color="#1e3a8a", va="center", ha="left")
+
+        # Exit marker
+        if exit_dt and exit_dt in dz.index:
+            ax_spx.axvline(exit_dt, color="#dc2626", lw=1.5, ls="--", alpha=0.8)
+            y_pos = spx_exit * 1.03
+            ax_spx.annotate("EXIT",
+                xy=(exit_dt, spx_exit), xytext=(exit_dt, y_pos),
+                fontsize=8, fontweight="bold", color="white",
+                ha="center",
+                bbox=dict(boxstyle="round,pad=0.3", fc="#dc2626", ec="none"),
+                arrowprops=dict(arrowstyle="-", color="#dc2626", lw=1))
+
+        # Peak & trough markers
+        ax_spx.axvline(peak_dt,   color="#6b7280", lw=1, ls=":", alpha=0.5)
+        ax_spx.axvline(trough_dt, color="#6b7280", lw=1, ls=":", alpha=0.5)
+
+        ax_spx.set_ylim(dz["spx"].min() * 0.92, dz["spx"].max() * 1.10)
+        ax_spx.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"{x:,.0f}"))
+
+        # ── Crashmeter score bars ──
+        ax_cm.set_facecolor("white")
+        score_clr = {0:"#93c5fd", 1:"#fbbf24", 2:"#fb923c", 3:"#dc2626", 4:"#7f1d1d"}
+        for i in range(len(dz)-1):
+            sc  = int(dz["score"].iloc[i])
+            dt0 = dz.index[i]
+            dt1 = dz.index[i+1]
+            ax_cm.fill_between([dt0, dt1], [sc, sc], color=score_clr.get(sc,"#93c5fd"), alpha=0.9, step="post")
+
+        if exit_dt:
+            ax_cm.axvline(exit_dt, color="#dc2626", lw=1.5, ls="--", alpha=0.8)
+
+        ax_cm.set_ylim(0, 4.5)
+        ax_cm.set_yticks([0,1,2,3,4])
+        ax_cm.set_yticklabels(["0","1","2","3","4"], fontsize=7.5, color="#6b7280")
+        ax_cm.set_ylabel("CM Score", fontsize=8, color="#f97316")
+        ax_cm.yaxis.label.set_color("#f97316")
+        ax_cm.tick_params(colors="#6b7280", labelsize=7.5)
+        for sp in ax_cm.spines.values(): sp.set_color("#e5e7eb")
+
+        # Label score legend
+        ax_cm.text(dz.index[-1], 0.2, "Crashmeter v3.0 Score (0-4)",
+                   fontsize=7, color="#f97316", ha="right")
+
+        plt.tight_layout()
+
+        # Stats dict untuk display
+        stats = {
+            "peak_spx":    f"{spx_peak:.0f} ({peak_dt.strftime('%b %Y')})",
+            "trough_spx":  f"{spx_trough:.0f} ({trough_dt.strftime('%b %Y')})",
+            "drawdown":    f"{drawdown:.1f}%",
+            "exit_signal": f"{exit_dt.strftime('%b %Y')} @ {spx_exit:.0f}" if exit_dt else "❌ Tidak terdeteksi",
+            "saved":       f"{-missed_pct:.1f}% vs {drawdown:.1f}% (save {saved_pct:.0f}%)" if exit_dt else "—",
+            "lead_time":   f"{lead_months:.0f} bulan" if exit_dt and lead_months > 0 else ("Setelah peak" if exit_dt else "—"),
+        }
+        return fig, stats
+
+    # ── UI ───────────────────────────────────────────────────────────────────
+    st.markdown("#### 🔬 Backtesting Crashmeter v3.0")
+    st.caption(
+        "Simulasi sinyal exit Crashmeter di setiap crash besar sejak 1996. "
+        "Data historis diambil langsung dari FRED."
     )
     st.info(
-        "⚠️ **Catatan overfitting:** Mengubah threshold berdasarkan data historis yang sama "
-        "membuat model terlihat bagus di masa lalu tapi belum tentu valid ke depan. "
-        "Gunakan fitur threshold dengan bijak — validasi selalu di event yang tidak dipakai untuk tuning.",
+        "⚠️ **Perhatian overfitting:** Threshold yang di-tune dari data historis yang sama "
+        "bisa terlihat bagus di masa lalu tapi belum tentu valid ke depan. "
+        "Gunakan slider sebagai eksplorasi, bukan final tuning.",
         icon=None
     )
 
-    # ── Threshold sliders ──
-    st.markdown("##### ⚙️ Parameter & threshold")
-    bc1, bc2, bc3 = st.columns(3)
-    with bc1:
-        thr_yc    = st.slider("A1: T10Y-3M threshold", 0.0, 2.0, 0.5, 0.05,
-                              help="Skor 1 jika T10Y-3M di bawah nilai ini")
-        thr_inv   = st.slider("A2: Periode inversi (bln)", 6, 24, 18, 1,
-                              help="Skor 1 selama bulan ke-0 s/d bulan ini setelah inversi")
-    with bc2:
-        thr_hyv   = st.slider("B1: HY OAS velocity (bps)", 50, 300, 150, 10,
-                              help="Skor 1 jika pergerakan 6-bln melebihi nilai ini")
-        thr_hyl   = st.slider("B2: HY OAS level (bps)",   300, 800, 550, 10,
-                              help="Skor 1 jika HY OAS di atas nilai ini")
-    with bc3:
-        thr_cape  = st.slider("C: Shiller CAPE threshold", 20, 45, 35, 1,
-                              help="Skor 1 jika CAPE di atas nilai ini")
-        exit_score = st.slider("Exit signal di skor ≥", 2, 4, 3, 1,
-                               help="Batas skor yang dianggap sinyal exit")
+    # ── Threshold controls ──
+    with st.expander("⚙️ Ubah threshold & parameter", expanded=False):
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            thr_yc   = st.slider("A1: T10Y-3M min", 0.0, 2.0, 0.5, 0.05)
+            thr_inv  = st.slider("A2: Periode pasca-inversi (bln)", 6, 24, 18, 1)
+        with tc2:
+            thr_hyv  = st.slider("B1: HY velocity maks (bps)", 50, 300, 150, 10)
+            thr_hyl  = st.slider("B2: HY level maks (bps)", 300, 800, 550, 10)
+        with tc3:
+            thr_cape = st.slider("C: CAPE maks", 20, 45, 35, 1)
+            exit_thr = st.slider("Exit signal di skor ≥", 2, 4, 3, 1)
 
-    run_bt = st.button("▶ Jalankan Backtesting")
+    bt_params = {"thr_yc":thr_yc,"thr_inv":thr_inv,"thr_hyv":thr_hyv,
+                 "thr_hyl":thr_hyl,"thr_cape":thr_cape}
 
-    if run_bt:
-        with st.spinner("Mengambil data historis dari FRED (1996–sekarang)..."):
+    EVENTS = [
+        {"name":"Dotcom Crash (2000–2002)",       "peak":"2000-03-31","trough":"2002-10-31","pre_months":18,"post_months":18},
+        {"name":"Great Financial Crisis (2007–09)","peak":"2007-10-31","trough":"2009-03-31","pre_months":24,"post_months":18},
+        {"name":"Covid Crash (2020)",              "peak":"2020-02-29","trough":"2020-03-31","pre_months":12,"post_months":12},
+        {"name":"Rate Hike Bear (2022)",           "peak":"2022-01-31","trough":"2022-10-31","pre_months":12,"post_months":12},
+    ]
+
+    if st.button("▶ Jalankan Backtesting", type="primary"):
+        with st.spinner("Mengambil data historis dari FRED..."):
             try:
-                # ── Fetch semua data historis ──
-                START = "1996-01-01"
-
-                def fred_history(series_id, api_key, start=START):
-                    url = "https://api.stlouisfed.org/fred/series/observations"
-                    p = {"series_id": series_id, "api_key": api_key,
-                         "file_type": "json", "observation_start": start,
-                         "sort_order": "asc", "limit": 10000}
-                    r = requests.get(url, params=p, timeout=30)
-                    r.raise_for_status()
-                    obs = r.json().get("observations", [])
-                    rows = [(o["date"], float(o["value"]))
-                            for o in obs if o["value"] not in (".", "nan")]
-                    return pd.DataFrame(rows, columns=["date", "value"])
-
-                df_yc   = fred_history("T10Y3M",        fred_key)
-                df_hy   = fred_history("BAMLH0A0HYM2",  fred_key)
-                df_spx  = fred_history("SP500",         fred_key)
-                df_cape_raw = fred_history("MEHOINUSA672N", fred_key)  # fallback
-
-                # Shiller CAPE dari FRED (series SHILLER_PE_RATIO tidak ada,
-                # pakai Multpl scrape monthly — atau gunakan series dari Yale via FRED)
-                # Gunakan series yang tersedia: Cyclically Adjusted PE Ratio
-                try:
-                    df_cape_raw = fred_history("CAPE", fred_key, start=START)
-                except:
-                    df_cape_raw = None
-
-                for df, name in [(df_yc,"T10Y3M"),(df_hy,"HY OAS"),(df_spx,"SP500")]:
-                    df["date"] = pd.to_datetime(df["date"])
-                    df.set_index("date", inplace=True)
-                    df.columns = [name]
-
-                # Resample ke bulanan
-                df_m = pd.DataFrame()
-                df_m["yc"]  = df_yc["T10Y3M"].resample("ME").last()
-                df_m["hy"]  = df_hy["HY OAS"].resample("ME").last()
-                df_m["spx"] = df_spx["SP500"].resample("ME").last()
-                df_m = df_m.dropna(subset=["yc","hy","spx"])
-
-                # CAPE — coba FRED, kalau tidak ada pakai approximation dari log
-                if df_cape_raw is not None and len(df_cape_raw) > 10:
-                    df_cape_raw["date"] = pd.to_datetime(df_cape_raw["date"])
-                    df_cape_raw.set_index("date", inplace=True)
-                    df_m["cape"] = df_cape_raw["value"].resample("ME").last().reindex(df_m.index, method="ffill")
-                else:
-                    # Hardcoded CAPE milestones untuk interpolasi kasar
-                    cape_pts = {
-                        "1996-01-31": 24.8, "2000-03-31": 44.2, "2002-10-31": 21.9,
-                        "2007-10-31": 27.5, "2009-03-31": 13.3, "2013-01-31": 22.2,
-                        "2018-01-31": 33.3, "2020-03-31": 24.8, "2021-12-31": 40.0,
-                        "2022-10-31": 27.5, "2024-01-31": 34.0, "2026-05-31": 41.7,
-                    }
-                    cape_series = pd.Series(
-                        {pd.Timestamp(k): v for k, v in cape_pts.items()}
-                    ).sort_index()
-                    combined_idx   = df_m.index.union(cape_series.index)
-                    cape_full      = cape_series.reindex(combined_idx)
-                    cape_interp    = cape_full.interpolate(method="time")
-                    df_m["cape"]   = cape_interp.reindex(df_m.index).ffill().bfill()
-
-                df_m["cape"] = df_m["cape"].ffill().bfill()
-                df_m = df_m.dropna()
-
-                # ── Hitung HY velocity 6-bln ──
-                df_m["hy_6m_ago"] = df_m["hy"].shift(6)
-                df_m["hy_vel_bps"] = (df_m["hy"] - df_m["hy_6m_ago"]).abs() * 100
-
-                # ── Deteksi inversi ──
-                df_m["inverted"] = df_m["yc"] < 0
-                # Untuk tiap bulan, hitung berapa bulan sejak inversi berakhir
-                inv_end_dates = []
-                last_inv_end  = None
-                for i, (dt, row) in enumerate(df_m.iterrows()):
-                    if i == 0:
-                        inv_end_dates.append(None)
-                        continue
-                    prev_inv = df_m.iloc[i-1]["inverted"]
-                    curr_inv = row["inverted"]
-                    if prev_inv and not curr_inv:
-                        last_inv_end = dt
-                    inv_end_dates.append(last_inv_end)
-                df_m["inv_end"] = inv_end_dates
-
-                def months_since_inv_end(row):
-                    if row["inv_end"] is None:
-                        return 999  # tidak ada inversi sebelumnya
-                    return (row.name - row["inv_end"]).days / 30.4
-
-                df_m["months_post_inv"] = df_m.apply(months_since_inv_end, axis=1)
-
-                # ── Hitung skor per bulan ──
-                def skor_bulan(row):
-                    a1 = 0 if row["yc"]  > thr_yc  else 1
-                    a2 = 1 if row["months_post_inv"] < thr_inv else 0
-                    b1 = 0 if row["hy_vel_bps"] < thr_hyv else 1
-                    b2 = 0 if row["hy"] * 100 < thr_hyl else 1
-                    c  = 1 if row["cape"] > thr_cape else 1 if row["cape"] > thr_cape else 0
-                    c  = 1 if row["cape"] > thr_cape else 0
-                    return a1 + a2 + b1 + b2 + c
-
-                df_m["score"] = df_m.apply(skor_bulan, axis=1)
-                df_m["exit_signal"] = df_m["score"] >= exit_score
-
-                # ── Definisi crash events ──
-                events = [
-                    {"name": "Resesi 1990–91",  "peak": "1990-07-31", "trough": "1991-03-31", "color": "#8b5cf6"},
-                    {"name": "Dotcom 2000–02",  "peak": "2000-03-31", "trough": "2002-10-31", "color": "#ef4444"},
-                    {"name": "GFC 2007–09",     "peak": "2007-10-31", "trough": "2009-03-31", "color": "#f97316"},
-                    {"name": "Covid 2020",      "peak": "2020-02-29", "trough": "2020-03-31", "color": "#06b6d4"},
-                    {"name": "Rate Hike 2022",  "peak": "2022-01-31", "trough": "2022-10-31", "color": "#eab308"},
-                ]
-
-                # ── Metrics per event ──
-                st.markdown("##### 📊 Hasil per crash event")
-
-                metrics_rows = []
-                for ev in events:
-                    peak_dt   = pd.Timestamp(ev["peak"])
-                    trough_dt = pd.Timestamp(ev["trough"])
-
-                    # Cari sinyal exit pertama sebelum/sekitar peak
-                    window = df_m[(df_m.index >= peak_dt - pd.DateOffset(months=24)) &
-                                  (df_m.index <= peak_dt + pd.DateOffset(months=3))]
-                    exit_rows = window[window["exit_signal"]]
-
-                    if len(exit_rows):
-                        first_exit = exit_rows.index[0]
-                        lead_months = (peak_dt - first_exit).days / 30.4
-                        spx_at_exit = df_m.loc[first_exit, "spx"] if first_exit in df_m.index else None
-                        spx_at_peak = df_m.loc[peak_dt, "spx"]   if peak_dt   in df_m.index else None
-                        spx_at_trough = df_m.loc[trough_dt, "spx"] if trough_dt in df_m.index else None
-
-                        if spx_at_exit and spx_at_trough and spx_at_peak:
-                            saved_pct  = (spx_at_exit - spx_at_trough) / spx_at_exit * 100
-                            missed_pct = (spx_at_peak - spx_at_exit)   / spx_at_peak * 100
-                        else:
-                            saved_pct = missed_pct = None
-
-                        metrics_rows.append({
-                            "Event": ev["name"],
-                            "Sinyal exit": first_exit.strftime("%b %Y"),
-                            "Lead time": f"{lead_months:.0f} bln sebelum peak" if lead_months >= 0 else f"{abs(lead_months):.0f} bln setelah peak",
-                            "SPX saat exit": f"{spx_at_exit:.0f}" if spx_at_exit else "—",
-                            "SPX trough": f"{spx_at_trough:.0f}" if spx_at_trough else "—",
-                            "Drawdown diselamatkan": f"{saved_pct:.1f}%" if saved_pct else "—",
-                            "Upside missed": f"{missed_pct:.1f}%" if missed_pct else "—",
-                        })
-                    else:
-                        metrics_rows.append({
-                            "Event": ev["name"],
-                            "Sinyal exit": "❌ Tidak terdeteksi",
-                            "Lead time": "—", "SPX saat exit": "—",
-                            "SPX trough": "—",
-                            "Drawdown diselamatkan": "—", "Upside missed": "—",
-                        })
-
-                if metrics_rows:
-                    st.dataframe(pd.DataFrame(metrics_rows), use_container_width=True, hide_index=True)
-
-                # ── Chart: SPX + Score timeline ──
-                st.markdown("##### 📈 SPX vs Crashmeter Score (1996–sekarang)")
-
-                fig, (ax_spx, ax_score) = plt.subplots(
-                    2, 1, figsize=(14, 8), sharex=True,
-                    gridspec_kw={"height_ratios": [3, 1]}
-                )
-                fig.patch.set_facecolor("#ffffff")
-
-                # SPX
-                ax_spx.set_facecolor("#ffffff")
-                ax_spx.plot(df_m.index, df_m["spx"], color="#1e40af", lw=1.5, label="S&P 500")
-                ax_spx.set_ylabel("S&P 500", color="#374151", fontsize=10)
-                ax_spx.tick_params(colors="#6b7280")
-                for sp in ax_spx.spines.values(): sp.set_color("#e5e7eb")
-
-                # Shade crash windows + exit signals
-                for ev in events:
-                    peak_dt   = pd.Timestamp(ev["peak"])
-                    trough_dt = pd.Timestamp(ev["trough"])
-                    ax_spx.axvspan(peak_dt, trough_dt, alpha=0.08, color=ev["color"])
-                    ax_spx.axvline(peak_dt, color=ev["color"], lw=1, ls="--", alpha=0.5)
-                    mid = peak_dt + (trough_dt - peak_dt) / 2
-                    ax_spx.text(mid, ax_spx.get_ylim()[1] * 0.02,
-                                ev["name"].split(" ")[0], fontsize=7,
-                                color=ev["color"], ha="center", va="bottom")
-
-                # Exit signal dots on SPX
-                exit_pts = df_m[df_m["exit_signal"]]
-                ax_spx.scatter(exit_pts.index, exit_pts["spx"],
-                               color="#ef4444", s=12, zorder=5,
-                               label=f"Exit signal (skor≥{exit_score})", alpha=0.7)
-                ax_spx.legend(fontsize=8, loc="upper left",
-                              facecolor="#ffffff", edgecolor="#e5e7eb")
-
-                # Score
-                ax_score.set_facecolor("#ffffff")
-                score_colors_map = {0:"#22c55e", 1:"#22c55e", 2:"#eab308",
-                                    3:"#f97316", 4:"#ef4444"}
-                for i in range(len(df_m)-1):
-                    sc = int(df_m["score"].iloc[i])
-                    ax_score.fill_between(
-                        [df_m.index[i], df_m.index[i+1]],
-                        [sc, sc], color=score_colors_map.get(sc, "#94a3b8"), alpha=0.85
-                    )
-                ax_score.axhline(exit_score, color="#ef4444", lw=1, ls="--", alpha=0.6)
-                ax_score.set_ylim(-0.2, 4.5)
-                ax_score.set_yticks([0,1,2,3,4])
-                ax_score.set_yticklabels(["0","1","2","3","4"], fontsize=8, color="#6b7280")
-                ax_score.set_ylabel("CM Score", color="#374151", fontsize=9)
-                ax_score.tick_params(colors="#6b7280")
-                for sp in ax_score.spines.values(): sp.set_color("#e5e7eb")
-
-                plt.tight_layout()
-                st.pyplot(fig, use_container_width=True)
-
-                # ── Per-event zoom chart ──
-                st.markdown("##### 🔍 Zoom per event")
-                ev_names = [e["name"] for e in events]
-                sel_ev = st.selectbox("Pilih event", ev_names)
-                ev = next(e for e in events if e["name"] == sel_ev)
-
-                peak_dt   = pd.Timestamp(ev["peak"])
-                trough_dt = pd.Timestamp(ev["trough"])
-                w_start   = peak_dt - pd.DateOffset(months=30)
-                w_end     = trough_dt + pd.DateOffset(months=12)
-                df_zoom   = df_m[(df_m.index >= w_start) & (df_m.index <= w_end)]
-
-                fig2, (az1, az2) = plt.subplots(
-                    2, 1, figsize=(12, 6), sharex=True,
-                    gridspec_kw={"height_ratios": [3, 1]}
-                )
-                fig2.patch.set_facecolor("#ffffff")
-
-                az1.set_facecolor("#ffffff")
-                az1.plot(df_zoom.index, df_zoom["spx"], color="#1e40af", lw=2)
-                az1.axvspan(peak_dt, trough_dt, alpha=0.1, color=ev["color"])
-                az1.axvline(peak_dt,   color=ev["color"], lw=1.5, ls="--",
-                            label=f"Peak ({peak_dt.strftime('%b %Y')})")
-                az1.axvline(trough_dt, color="#6b7280", lw=1.5, ls=":",
-                            label=f"Trough ({trough_dt.strftime('%b %Y')})")
-
-                exit_zoom = df_zoom[df_zoom["exit_signal"]]
-                if len(exit_zoom):
-                    az1.scatter(exit_zoom.index, exit_zoom["spx"],
-                                color="#ef4444", s=30, zorder=5,
-                                label=f"Exit signal")
-                    first_exit_zoom = exit_zoom.index[0]
-                    az1.axvline(first_exit_zoom, color="#ef4444", lw=1.5, ls="-",
-                                alpha=0.6, label=f"1st exit ({first_exit_zoom.strftime('%b %Y')})")
-
-                az1.set_title(f"{ev['name']} — SPX vs Crashmeter", fontsize=11, color="#111827")
-                az1.set_ylabel("S&P 500", fontsize=9, color="#374151")
-                az1.tick_params(colors="#6b7280")
-                for sp in az1.spines.values(): sp.set_color("#e5e7eb")
-                az1.legend(fontsize=8, facecolor="#ffffff", edgecolor="#e5e7eb")
-
-                az2.set_facecolor("#ffffff")
-                for i in range(len(df_zoom)-1):
-                    sc = int(df_zoom["score"].iloc[i])
-                    az2.fill_between(
-                        [df_zoom.index[i], df_zoom.index[i+1]],
-                        [sc, sc], color=score_colors_map.get(sc, "#94a3b8"), alpha=0.85
-                    )
-                az2.axhline(exit_score, color="#ef4444", lw=1, ls="--", alpha=0.6)
-                az2.set_ylim(-0.2, 4.5)
-                az2.set_yticks([0,1,2,3,4])
-                az2.set_yticklabels(["0","1","2","3","4"], fontsize=8, color="#6b7280")
-                az2.set_ylabel("CM Score", fontsize=9, color="#374151")
-                az2.tick_params(colors="#6b7280")
-                for sp in az2.spines.values(): sp.set_color("#e5e7eb")
-
-                plt.tight_layout()
-                st.pyplot(fig2, use_container_width=True)
-
-                # ── Saran parameter ──
-                st.markdown("##### 💡 Observasi otomatis")
-                detected = sum(1 for r in metrics_rows if r["Sinyal exit"] != "❌ Tidak terdeteksi")
-                total_ev = len(events)
-                st.markdown(f"Dengan threshold saat ini, Crashmeter mendeteksi **{detected}/{total_ev}** crash events.")
-                if detected < total_ev:
-                    st.warning(
-                        "Beberapa crash tidak terdeteksi. Coba turunkan threshold A1, B1, atau B2 "
-                        "— tapi perhatikan apakah false positive ikut naik."
-                    )
-                false_signals = len(df_m[df_m["exit_signal"]]) - detected
-                if false_signals > total_ev * 3:
-                    st.warning(
-                        f"Ada ~{false_signals} bulan dengan exit signal — kemungkinan ada false positive. "
-                        "Coba naikkan threshold atau exit score."
-                    )
-                else:
-                    st.success(f"Jumlah exit signal ({len(df_m[df_m['exit_signal']])} bulan total) terlihat reasonable.")
-
+                df_hist = build_monthly(fred_key)
             except Exception as e:
-                st.error(f"Error saat backtesting: {e}")
-                st.exception(e)
+                st.error(f"Gagal ambil data: {e}")
+                st.stop()
+
+        st.success(f"Data siap: {len(df_hist)} bulan ({df_hist.index[0].strftime('%b %Y')} – {df_hist.index[-1].strftime('%b %Y')})")
+
+        for ev in EVENTS:
+            st.markdown(f"---")
+            fig, stats = make_event_chart(df_hist, ev, bt_params, exit_thr)
+            if fig is None:
+                st.warning(f"{ev['name']}: data tidak cukup dalam range ini.")
+                continue
+
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+            # Key stats + interpretasi — 2 kolom
+            ks_col, interp_col = st.columns([1, 1], gap="large")
+
+            with ks_col:
+                st.markdown("""
+                <div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px 18px'>
+                <p style='font-size:10px;letter-spacing:0.08em;color:#94a3b8;margin:0 0 10px'>KEY STATS</p>
+                """, unsafe_allow_html=True)
+
+                def stat_row(label, value, highlight=False):
+                    color = "#dc2626" if highlight else "#111827"
+                    weight = "600" if highlight else "400"
+                    st.markdown(
+                        f"<div style='display:flex;justify-content:space-between;"
+                        f"font-size:13px;padding:3px 0;border-bottom:1px solid #f1f5f9'>"
+                        f"<span style='color:#64748b'>{label}</span>"
+                        f"<span style='color:{color};font-weight:{weight}'>{value}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                stat_row("Peak SPX",            stats["peak_spx"])
+                stat_row("Trough SPX",          stats["trough_spx"],   highlight=True)
+                stat_row("Total drawdown",       stats["drawdown"],     highlight=True)
+                stat_row("Signal EXIT Crashmeter", stats["exit_signal"])
+                stat_row("Penyelamatan",         stats["saved"],        highlight=True)
+                stat_row("Lead time ke bottom",  stats["lead_time"])
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with interp_col:
+                # Auto-generate interpretasi berdasarkan stats
+                has_exit = stats["exit_signal"] != "❌ Tidak terdeteksi"
+                if has_exit:
+                    interp = (
+                        f"Crashmeter berhasil memberikan sinyal EXIT **{stats['lead_time']}** "
+                        f"sebelum bottom. Dengan keluar di **{stats['exit_signal']}**, "
+                        f"investor bisa menyelamatkan sebagian besar drawdown — "
+                        f"**{stats['saved']}**.\n\n"
+                        f"Total drawdown dari peak ke trough adalah **{stats['drawdown']}**. "
+                    )
+                    if "save" in stats["saved"] and int(stats["saved"].split("save ")[1].replace("%","").replace(")","")) > 40:
+                        interp += "Sinyal datang cukup awal — masih ada window yang lega untuk eksekusi."
+                    else:
+                        interp += "Waktu exit cukup sempit — perlu eksekusi cepat begitu skor 3 tercapai."
+                else:
+                    interp = (
+                        f"Crashmeter **tidak mendeteksi** sinyal exit yang jelas sebelum crash ini. "
+                        f"Kemungkinan karena crash bersifat event-triggered (bukan sistemik dari debt/valuasi), "
+                        f"atau semua parameter belum aktif bersamaan. "
+                        f"Total drawdown yang terjadi: **{stats['drawdown']}**."
+                    )
+
+                st.markdown(
+                    f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:8px;"
+                    f"padding:14px 18px;font-size:13px;line-height:1.7;color:#374151'>"
+                    f"<p style='font-size:10px;letter-spacing:0.08em;color:#94a3b8;margin:0 0 8px'>INTERPRETASI</p>"
+                    f"{interp.replace(chr(10), '<br>')}"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        # ── Summary tabel semua event ──
+        st.markdown("---")
+        st.markdown("##### 📋 Ringkasan semua event")
+        summary = []
+        for ev in EVENTS:
+            _, stats = make_event_chart(df_hist, ev, bt_params, exit_thr)
+            if stats:
+                summary.append({
+                    "Event": ev["name"],
+                    "Exit signal": stats["exit_signal"],
+                    "Lead time": stats["lead_time"],
+                    "Total drawdown": stats["drawdown"],
+                    "Diselamatkan": stats["saved"],
+                })
+        if summary:
+            st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+
     else:
-        st.caption("Atur parameter di atas lalu klik **▶ Jalankan Backtesting**.")
+        st.caption("Klik **▶ Jalankan Backtesting** untuk memulai.")
