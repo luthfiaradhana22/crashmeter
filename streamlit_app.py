@@ -706,11 +706,12 @@ with tab2:
                     cape_series = pd.Series(
                         {pd.Timestamp(k): v for k, v in cape_pts.items()}
                     ).sort_index()
-                    df_m["cape"] = cape_series.reindex(
-                        df_m.index.union(cape_series.index)
-                    ).interpolate(method="time").reindex(df_m.index)
+                    combined_idx   = df_m.index.union(cape_series.index)
+                    cape_full      = cape_series.reindex(combined_idx)
+                    cape_interp    = cape_full.interpolate(method="time")
+                    df_m["cape"]   = cape_interp.reindex(df_m.index).ffill().bfill()
 
-                df_m["cape"] = df_m["cape"].ffill()
+                df_m["cape"] = df_m["cape"].ffill().bfill()
                 df_m = df_m.dropna()
 
                 # ── Hitung HY velocity 6-bln ──
